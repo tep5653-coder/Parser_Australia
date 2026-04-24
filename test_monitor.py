@@ -4,10 +4,12 @@ from monitor import (
     PlayerEntry,
     TeamDiff,
     TeamLineup,
+    build_parser,
     calculate_team_diff,
     format_alert,
+    is_noise_player_name,
+    is_noise_team_name,
     normalize_player_name,
-    build_parser,
 )
 
 
@@ -52,7 +54,7 @@ def test_format_alert() -> None:
     text = format_alert(result)
     assert "https://example.com/current" in text
     assert "https://example.com/prev" in text
-    assert "<a href=\"https://example.com/old\">Old</a>" in text
+    assert '<a href="https://example.com/old">Old</a>' in text
     assert "Changes: 3" in text
 
 
@@ -66,3 +68,15 @@ def test_headless_flag_accepts_no_value() -> None:
     parser = build_parser()
     args = parser.parse_args(["--dry-run", "--headless"])
     assert args.headless is True
+
+
+def test_browser_channel_argument_is_supported() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["--dry-run", "--browser-channel", "chrome"])
+    assert args.browser_channel == "chrome"
+
+
+def test_noise_detection_filters_navigation_labels() -> None:
+    assert is_noise_team_name("Media")
+    assert is_noise_player_name("Fixtures")
+    assert not is_noise_player_name("Ivan Petrov")

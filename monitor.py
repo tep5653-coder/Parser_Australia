@@ -17,7 +17,6 @@ import os
 import re
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any
 from urllib.parse import urljoin
 
 import aiohttp
@@ -47,6 +46,8 @@ class Config:
     poll_interval_seconds: int
     prestart_minutes: int
     post_start_grace_minutes: int
+    browser_channel: str | None
+    hydration_wait_seconds: float
     telegram_token: str | None
     telegram_chat_id: str | None
 
@@ -99,7 +100,11 @@ class Monitor:
     async def run(self) -> None:
         self.logger.info("Starting monitor. headless=%s dry_run=%s", self.config.headless, self.config.dry_run)
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=self.config.headless)
+            launch_kwargs: dict[str, object] = {"headless": self.config.headless}
+            if self.config.browser_channel:
+                launch_kwargs["channel"] = self.config.browser_channel
+                launch_kwargs["args"] = ["--disable-blink-features=AutomationControlled"]
+            browser = await p.chromium.launch(**launch_kwargs)
             try:
                 page = await browser.new_page()
                 fixtures = await self.fetch_upcoming_fixtures(page)
@@ -110,7 +115,7 @@ class Monitor:
                 await browser.close()
 
     async def fetch_upcoming_fixtures(self, page: Page) -> list[Fixture]:
-        await navigate_and_check_cloudflare(page, self.config.fixtures_url)
+        await navigate_and_check_cloudflare(page, self.config.fixtures_url, self.config.hydration_wait_seconds)
         now = datetime.now(UTC)
 
         raw_matches = await extract_fixture_candidates(page)
@@ -169,7 +174,7 @@ class Monitor:
             lineups: tuple[TeamLineup, TeamLineup] | None = None
             while datetime.now(UTC) <= deadline:
                 try:
-                    await navigate_and_check_cloudflare(page, fixture.match_url)
+                    await navigate_and_check_cloudflare(page, fixture.match_url, self.config.hydration_wait_seconds)
                 except CloudflareDetectedError as exc:
                     self.logger.warning(
                         "Cloudflare challenge on match page (%s). In headed mode complete challenge manually. %s",
@@ -231,7 +236,7 @@ class Monitor:
 
         page = await browser.new_page()
         try:
-            await navigate_and_check_cloudflare(page, prev_url)
+            await navigate_and_check_cloudflare(page, prev_url, self.config.hydration_wait_seconds)
             previous_lineups = await parse_lineups(page, prev_url)
             if previous_lineups is None:
                 self.logger.warning("Previous match lineups unavailable: %s", prev_url)
@@ -252,9 +257,9 @@ class Monitor:
         )
 
 
-async def navigate_and_check_cloudflare(page: Page, url: str) -> None:
+async def navigate_and_check_cloudflare(page: Page, url: str, hydration_wait_seconds: float = 1.0) -> None:
     await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-    await asyncio.sleep(1.0)
+    await asyncio.sleep(hydration_wait_seconds)
     title = (await page.title()).strip().lower()
     body_text = (await page.inner_text("body")).strip().lower()
     haystack = f"{title}\n{body_text[:1000]}"
@@ -270,15 +275,20 @@ async def extract_fixture_candidates(page: Page) -> list[dict[str, str]]:
     return await page.evaluate(
         """
         () => {
-          const rows = Array.from(document.querySelectorAll('a, article, li, div'));
+          const rows = Array.from(document.querySelectorAll('a[href*="matchcentre"]'));
           const out = [];
+          const seen = new Set();
           for (const node of rows) {
-            const text = (node.textContent || '').trim();
+            const card = node.closest('article, li, [class*=fixture], [class*=match], div') || node;
+            const text = (card.textContent || node.textContent || '').trim();
             if (!text || text.length < 10) continue;
-            if (!/\bvs\b|\bv\b|[-–—]/i.test(text)) continue;
-            const href = node.closest('a')?.href || node.querySelector('a')?.href || '';
-            const datetimeAttr = node.getAttribute('datetime') || node.querySelector('time')?.getAttribute('datetime') || '';
-            const timeText = node.querySelector('time')?.textContent || '';
+            if (!/\\bvs\\b|\\bv\\b|[-–—]/i.test(text)) continue;
+            const href = node.href || '';
+            if (!href || !/matchcentre[?]m=/i.test(href)) continue;
+            if (seen.has(href)) continue;
+            seen.add(href);
+            const datetimeAttr = card.getAttribute('datetime') || card.querySelector('time')?.getAttribute('datetime') || '';
+            const timeText = card.querySelector('time')?.textContent || '';
             out.push({ text, href, datetime: datetimeAttr, timeText });
           }
           return out.slice(0, 400);
@@ -297,7 +307,7 @@ def parse_fixture_candidate(
     if not text:
         return None
 
-    pair = re.search(r"([A-Za-z0-9 .&'\-/]+?)\s+(?:vs|v|[-–—])\s+([A-Za-z0-9 .&'\-/]+)", text, re.IGNORECASE)
+    pair = re.search(r"([A-Za-z0-9 .&'\\-/]+?)\\s+(?:vs|v|[-–—])\\s+([A-Za-z0-9 .&'\\-/]+)", text, re.IGNORECASE)
     if not pair:
         return None
     home = pair.group(1).strip(" -")
@@ -339,8 +349,8 @@ def parse_datetime(raw: str, timezone_offset_minutes: int, reference: datetime |
         pass
 
     ref = reference or datetime.now(UTC)
-    date_match = re.search(r"(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?", s)
-    time_match = re.search(r"(\d{1,2}):(\d{2})", s)
+    date_match = re.search(r"(\\d{1,2})[./-](\\d{1,2})(?:[./-](\\d{2,4}))?", s)
+    time_match = re.search(r"(\\d{1,2}):(\\d{2})", s)
     if not time_match:
         return None
 
@@ -364,6 +374,7 @@ def parse_datetime(raw: str, timezone_offset_minutes: int, reference: datetime |
 
 
 async def parse_lineups(page: Page, source_url: str) -> tuple[TeamLineup, TeamLineup] | None:
+    await open_lineups_tab(page)
     payload = await page.evaluate(
         r"""
         () => {
@@ -385,7 +396,8 @@ async def parse_lineups(page: Page, source_url: str) -> tuple[TeamLineup, TeamLi
               if (!t || t.length < 2 || t.length > 40) continue;
               if (/coach|manager|substitute|bench|referee|stadium/i.test(t)) continue;
               if (!/[A-Za-z]/.test(t)) continue;
-              if (/\d{1,2}:\d{2}/.test(t)) continue;
+              if (/\\d{1,2}:\\d{2}/.test(t)) continue;
+              if (/fixtures|results|ladders|stats|clubs|grounds|support|media|documents|privacy/i.test(t)) continue;
               const href = p.tagName.toLowerCase() === 'a' ? p.href : p.querySelector('a')?.href || '';
               players.push({ name: t, href });
             }
@@ -400,10 +412,17 @@ async def parse_lineups(page: Page, source_url: str) -> tuple[TeamLineup, TeamLi
 
     parsed_teams: list[TeamLineup] = []
     for team in payload:
+        team_name = (team.get("teamName") or "Unknown").strip()
+        if is_noise_team_name(team_name):
+            continue
         unique = deduplicate_players(team.get("players", []))
-        starters = [PlayerEntry(name=p["name"], href=p.get("href") or None) for p in unique[:11]]
+        starters = [
+            PlayerEntry(name=p["name"], href=p.get("href") or None)
+            for p in unique
+            if not is_noise_player_name(p.get("name", ""))
+        ][:11]
         if len(starters) >= 11:
-            parsed_teams.append(TeamLineup(team_name=team.get("teamName", "Unknown"), starters=starters))
+            parsed_teams.append(TeamLineup(team_name=team_name, starters=starters))
 
     if len(parsed_teams) >= 2:
         logging.getLogger("monitor").debug(
@@ -418,6 +437,26 @@ async def parse_lineups(page: Page, source_url: str) -> tuple[TeamLineup, TeamLi
 
     logging.getLogger("monitor").debug("Failed to parse complete 11+11 lineups from %s", source_url)
     return None
+
+
+async def open_lineups_tab(page: Page) -> None:
+    selectors = [
+        "a:has-text('Line Up')",
+        "button:has-text('Line Up')",
+        "a:has-text('Lineup')",
+        "button:has-text('Lineup')",
+        "a:has-text('LINE UP')",
+        "button:has-text('LINE UP')",
+    ]
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if await locator.count() > 0:
+                await locator.click(timeout=3_000)
+                await asyncio.sleep(1.0)
+                return
+        except Exception:  # noqa: BLE001
+            continue
 
 
 async def find_previous_match_url(browser: Browser, fixture: Fixture) -> str | None:
@@ -456,6 +495,29 @@ def normalize_player_name(value: str) -> str:
     cleaned = re.sub(r"\s+", " ", value).strip().lower()
     cleaned = re.sub(r"[^a-zа-яё0-9 ]+", "", cleaned)
     return cleaned
+
+
+def is_noise_player_name(value: str) -> bool:
+    normalized = normalize_player_name(value)
+    if not normalized:
+        return True
+    return normalized in {
+        "fixtures",
+        "results",
+        "ladders",
+        "stats",
+        "clubs",
+        "grounds",
+        "support",
+        "media",
+        "documents",
+        "privacy policy",
+    }
+
+
+def is_noise_team_name(value: str) -> bool:
+    normalized = normalize_player_name(value)
+    return normalized in {"media", "support", "fixtures", "results", "ladders", "stats", "clubs", "grounds"}
 
 
 def calculate_team_diff(current: TeamLineup, previous: TeamLineup) -> TeamDiff:
@@ -553,6 +615,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--poll-interval-seconds", type=int, default=60)
     parser.add_argument("--prestart-minutes", type=int, default=60)
     parser.add_argument("--post-start-grace-minutes", type=int, default=5)
+    parser.add_argument("--browser-channel", default=os.getenv("PLAYWRIGHT_BROWSER_CHANNEL"))
+    parser.add_argument("--hydration-wait-seconds", type=float, default=8.0)
     parser.add_argument("--telegram-token", default=os.getenv("TELEGRAM_BOT_TOKEN"))
     parser.add_argument("--telegram-chat-id", default=os.getenv("TELEGRAM_CHAT_ID"))
     parser.add_argument("--log-level", default="INFO")
@@ -574,6 +638,8 @@ def args_to_config(args: argparse.Namespace) -> Config:
         poll_interval_seconds=args.poll_interval_seconds,
         prestart_minutes=args.prestart_minutes,
         post_start_grace_minutes=args.post_start_grace_minutes,
+        browser_channel=args.browser_channel,
+        hydration_wait_seconds=args.hydration_wait_seconds,
         telegram_token=args.telegram_token,
         telegram_chat_id=args.telegram_chat_id,
     )
